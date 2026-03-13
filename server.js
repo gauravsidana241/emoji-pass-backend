@@ -1,6 +1,7 @@
 const express    = require("express");
 const mongoose   = require("mongoose");
 const cors       = require("cors");
+const bcrypt     = require("bcryptjs");
 require("dotenv").config();
 
 const app = express();
@@ -16,27 +17,22 @@ mongoose.connect(process.env.MONGO_URI)
 const participantSchema = new mongoose.Schema({
   studentId: { type: String, required: true, unique: true },
 
-  // Per-mode results — null until that mode is completed
-  number: {
-    loginTimeMs: Number,
-    errorCount:  Number,
-    completedAt: Date,
-  },
-  emoji: {
-    loginTimeMs: Number,
-    errorCount:  Number,
-    completedAt: Date,
-  },
-  mixed: {
-    loginTimeMs: Number,
-    errorCount:  Number,
-    completedAt: Date,
+  // Hashed passwords per mode
+  passwords: {
+    number: { type: String, default: null },
+    emoji:  { type: String, default: null },
+    mixed:  { type: String, default: null },
   },
 
-  // Survey answers — null until submitted
+  // Per-mode results
+  number: { loginTimeMs: Number, errorCount: Number, completedAt: Date },
+  emoji:  { loginTimeMs: Number, errorCount: Number, completedAt: Date },
+  mixed:  { loginTimeMs: Number, errorCount: Number, completedAt: Date },
+
+  // Survey
   survey: {
     usedEmojiInputBefore: Boolean,
-    intuitiveness:        Number,   // 1–5
+    intuitiveness:        Number,
     ageRange:             String,
     submittedAt:          Date,
   },
@@ -46,101 +42,118 @@ const participantSchema = new mongoose.Schema({
 
 const Participant = mongoose.model("Participant", participantSchema);
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── POST /api/register ───────────────────────────────────────────────────────
+// Body: { studentId, mode, password }  (password is array joined as string)
+app.post("/api/register", async (req, res) => {
+  const { studentId, mode, password } = req.body;
+  if (!studentId || !mode || !password) return res.status(400).json({ error: "Missing fields" });
 
-// POST /api/result  — save one mode result
+  try {
+    const participant = await Participant.findOne({ studentId });
+
+    // If already registered for this mode, reject
+    if (participant?.passwords?.[mode]) {
+      return res.status(409).json({ error: "Already registered for this mode" });
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+
+    await Participant.findOneAndUpdate(
+      { studentId },
+      { $set: { [`passwords.${mode}`]: hashed } },
+      { upsert: true, new: true }
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ─── POST /api/login ──────────────────────────────────────────────────────────
+// Body: { studentId, mode, password }
+app.post("/api/login", async (req, res) => {
+  const { studentId, mode, password } = req.body;
+  if (!studentId || !mode || !password) return res.status(400).json({ error: "Missing fields" });
+
+  try {
+    const participant = await Participant.findOne({ studentId });
+    if (!participant?.passwords?.[mode]) {
+      return res.status(404).json({ error: "Not registered for this mode" });
+    }
+
+    const match = await bcrypt.compare(password, participant.passwords[mode]);
+    if (!match) return res.status(401).json({ error: "Incorrect password" });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ─── POST /api/result ─────────────────────────────────────────────────────────
 // Body: { studentId, mode, loginTimeMs, errorCount }
 app.post("/api/result", async (req, res) => {
   const { studentId, mode, loginTimeMs, errorCount } = req.body;
-
   if (!studentId || !mode || loginTimeMs == null || errorCount == null) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
-
-  if (!["number", "emoji", "mixed"].includes(mode)) {
-    return res.status(400).json({ error: "Invalid mode" });
+    return res.status(400).json({ error: "Missing fields" });
   }
 
   try {
-    const update = {
-      [mode]: { loginTimeMs, errorCount, completedAt: new Date() },
-    };
-
-    const participant = await Participant.findOneAndUpdate(
+    await Participant.findOneAndUpdate(
       { studentId },
-      { $set: update },
+      { $set: { [mode]: { loginTimeMs, errorCount, completedAt: new Date() } } },
       { upsert: true, new: true }
     );
-
-    res.json({ ok: true, participant });
+    res.json({ ok: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// POST /api/survey  — save survey answers
-// Body: { studentId, usedEmojiInputBefore, intuitiveness, ageRange }
+// ─── POST /api/survey ─────────────────────────────────────────────────────────
 app.post("/api/survey", async (req, res) => {
   const { studentId, usedEmojiInputBefore, intuitiveness, ageRange } = req.body;
-
   if (!studentId || usedEmojiInputBefore == null || !intuitiveness || !ageRange) {
-    return res.status(400).json({ error: "Missing required fields" });
+    return res.status(400).json({ error: "Missing fields" });
   }
 
   try {
-    const participant = await Participant.findOneAndUpdate(
+    await Participant.findOneAndUpdate(
       { studentId },
-      {
-        $set: {
-          survey: {
-            usedEmojiInputBefore,
-            intuitiveness,
-            ageRange,
-            submittedAt: new Date(),
-          },
-        },
-      },
+      { $set: { survey: { usedEmojiInputBefore, intuitiveness, ageRange, submittedAt: new Date() } } },
       { upsert: true, new: true }
     );
-
-    res.json({ ok: true, participant });
+    res.json({ ok: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// GET /api/stats  — aggregated results for analysis
+// ─── GET /api/stats ───────────────────────────────────────────────────────────
 app.get("/api/stats", async (req, res) => {
   try {
     const stats = await Participant.aggregate([
       {
         $group: {
           _id: null,
-          // Number mode
-          avgNumberTime:   { $avg: "$number.loginTimeMs" },
-          avgNumberErrors: { $avg: "$number.errorCount" },
-          // Emoji mode
-          avgEmojiTime:    { $avg: "$emoji.loginTimeMs" },
-          avgEmojiErrors:  { $avg: "$emoji.errorCount" },
-          // Mixed mode
-          avgMixedTime:    { $avg: "$mixed.loginTimeMs" },
-          avgMixedErrors:  { $avg: "$mixed.errorCount" },
-          // Totals
-          totalParticipants: { $sum: 1 },
-          // Survey
+          avgNumberTime:    { $avg: "$number.loginTimeMs" },
+          avgNumberErrors:  { $avg: "$number.errorCount" },
+          avgEmojiTime:     { $avg: "$emoji.loginTimeMs" },
+          avgEmojiErrors:   { $avg: "$emoji.errorCount" },
+          avgMixedTime:     { $avg: "$mixed.loginTimeMs" },
+          avgMixedErrors:   { $avg: "$mixed.errorCount" },
+          totalParticipants:{ $sum: 1 },
           avgIntuitiveness: { $avg: "$survey.intuitiveness" },
         },
       },
     ]);
 
-    // Per-participant data for median calculation
-    const all = await Participant.find(
-      {},
-      { studentId: 0, __v: 0 }
-    ).lean();
-
+    const all = await Participant.find({}, { "passwords": 0, __v: 0 }).lean();
     res.json({ summary: stats[0] || {}, participants: all });
   } catch (err) {
     console.error(err);
